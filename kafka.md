@@ -1251,6 +1251,55 @@ Topic 拆成多个 Partition，分布在不同 Broker → 多 Broker 并行写 +
 4. 网络拥塞或丢包重传
 5. Consumer poll 间隔过大
 
+### 低延迟调优 Checklist（P99 < 10ms 目标）
+
+面试常问"Kafka 能做低延迟吗？怎么调？"。答案是**可以**，但需要从五层同时优化：
+
+```
+延迟的五个来源 + 对应优化：
+
+1️⃣ Producer 攒批延迟（通常最大头）
+   ☐ linger.ms = 0 或 1-2ms
+   ☐ batch.size 设小（如 4KB）
+   ⚠️ 代价：吞吐下降 5-10x
+
+2️⃣ 网络 RTT（Producer → Leader）
+   ☐ Producer/Consumer 与 Leader 部署在同一 AZ（减少跨 AZ RTT）
+   ☐ 使用高带宽低延迟网卡（10Gbps+）
+   ☐ 开启 TCP_NODELAY（禁用 Nagle 算法）
+
+3️⃣ Broker 端处理延迟
+   ☐ acks=1（不等 Follower 同步，牺牲可靠性）
+   ☐ 确保足够 Handler 线程（num.io.threads）
+   ☐ 确保 RequestQueue 不满（queued.max.requests 足够大）
+   ☐ 监控 RequestHandlerAvgIdlePercent > 0.5
+
+4️⃣ 磁盘 I/O 延迟
+   ☐ 使用本地 NVMe SSD（非网络存储）
+   ☐ 独立磁盘给 Kafka（不与 OS/其他应用共享）
+   ☐ 关闭日志压缩（compact 需要额外 I/O）
+   ⚠️ 用 JBOD 而不是单盘
+
+5️⃣ Consumer 端延迟
+   ☐ fetch.min.bytes = 1（有数据立即返回，不等攒批）
+   ☐ fetch.max.wait.ms = 5-10ms
+   ☐ max.poll.records 设小（如 10-50）
+```
+
+**低延迟 vs 高吞吐的参数对决**：
+
+| 参数 | 高吞吐配置 | 低延迟配置 |
+|------|-----------|-----------|
+| `linger.ms` | 10-100ms | 0-2ms |
+| `batch.size` | 64KB-1MB | 4-16KB |
+| `acks` | all | 1 |
+| `compression.type` | lz4/zstd | none（省 CPU） |
+| `fetch.min.bytes` | 1MB | 1 |
+| `fetch.max.wait.ms` | 500ms | 5-10ms |
+| `max.poll.records` | 500-1000 | 10-50 |
+
+> **面试一句话**：Kafka 可以做到 P99 < 10ms，但必须牺牲吞吐和可靠性。核心思想是"消除所有等待"——Producer 不等攒批、Broker 不等 Follower、Consumer 不等攒数据。
+
 ### JVM GC 对 Kafka 性能的影响
 
 Kafka Broker 是 JVM 应用，GC 停顿会直接影响整个集群的延迟和可用性：
@@ -1560,6 +1609,69 @@ CooperativeSticky 模式：
 4. 使用 CooperativeSticky 减少 Rebalance 影响范围
 5. 静态成员（`group.instance.id`）：Consumer 重启后 Coordinator 会等它回来而不是立刻触发 Rebalance
 6. 监控 Rebalance 频率：每分钟都有 = 配置或业务有严重问题
+
+### 静态成员（Static Membership）详解
+
+静态成员是 Kafka 2.3+ 引入的重要 Rebalance 优化机制：
+
+```
+传统（动态成员）：
+   Consumer 重启 → 发送 LeaveGroup → Coordinator 立即触发 Rebalance
+   → 分区重新分配给剩余 Consumer → 重启的 Consumer 再加入 → 再次 Rebalance
+   整个过程：两次 Rebalance，所有 Consumer 受影响
+
+静态成员（group.instance.id）：
+   Consumer 重启 → Coordinator 发现它没发 LeaveGroup（进程被 kill）
+   → 在 session.timeout.ms 内给它"留位" → 不触发 Rebalance
+   → Consumer 重新连接后发送 JoinGroup（带相同 group.instance.id）
+   → Coordinator 识别为同一成员 → 恢复其原有分区分配 → 不触发 Rebalance！
+   整个过程：零次 Rebalance
+```
+
+**配置方式**：
+```java
+// Consumer 端配置
+props.put("group.instance.id", "consumer-1");  // 每个 Consumer 唯一且固定
+props.put("session.timeout.ms", "30000");       // 重启窗口 < session.timeout.ms
+
+// 典型场景：滚动发布
+// Pod-1 重启 → 30 秒内重新回来 → 分区不迁移 → 其他 Pod 感知不到任何变化
+```
+
+> **限制**：静态成员在 `session.timeout.ms` 内必须重新加入。如果超过这个时间 Coordinator 判定它已死 → 触发正常 Rebalance。因此 session.timeout.ms 需要在"快速检测故障"和"给重启留时间"之间权衡。建议设置 30-45 秒。
+
+### KIP-848：新一代 Consumer Rebalance 协议（Kafka 3.7+）
+
+Kafka 3.7 引入了全新的 Consumer Group 协议（KIP-848），是 Rebalance 机制十年来最大的重构：
+
+```
+KIP-848 的核心变化：
+
+1. 服务端驱动的分配：
+   旧协议：Consumer Leader 在客户端计算分配方案 → SyncGroup 上报
+   新协议：Coordinator（服务端）计算分配方案 → 直接下发给 Consumer
+   好处：消除 Consumer Leader 单点、简化客户端逻辑
+
+2. 增量式分配（Incremental Assignment）：
+   旧协议：每次分配都是"全量"（即使只加了一个 Consumer）
+   新协议：只下发"变更的部分"（哪个 Consumer 得到了哪个新分区）
+   好处：减少网络开销、更快收敛
+
+3. 更精确的健康检测：
+   旧协议：依赖 session.timeout.ms 二进制检测（活/死）
+   新协议：支持 member.epoch 版本号，检测"脑裂"场景
+   好处：减少"假死 → 误触发 Rebalance"的情况
+```
+
+> **兼容性**：KIP-848 与旧协议兼容。Broker 同时支持两种协议，Consumer 可逐步升级。使用新协议需要 Consumer 客户端升级到 Kafka 3.7+ 的对应版本。
+
+| 维度 | 旧协议 (Eager/Cooperative) | KIP-848 新协议 |
+|------|--------------------------|---------------|
+| 分配计算位置 | Consumer Leader（客户端） | Coordinator（服务端） |
+| 分配下发方式 | 全量 | 增量 |
+| 最小 Consumer 暂停 | 0（Cooperative） | 0（且更快收敛） |
+| 滚动发布影响 | 静态成员可避免 | 原生支持"无感"重启 |
+| 适用 Kafka 版本 | 0.9 ~ 当前 | 3.7+ |
 
 ### 分区分配策略
 
@@ -2124,14 +2236,50 @@ Consumer Lag = 最新消息 Offset - 当前消费 Offset。
 - 容量规划：根据 DAU 增长提前扩容
 - Chaos Engineering：定期演练宕机和大促峰值
 
-### 部分分区积压
+### 部分分区积压（热点分区问题）
 
 如果只有某几个分区积压，说明 **key 分布不均**——比如用 userId 做 key，某个大 V 的消息量是普通用户的 1000 倍。
 
-解决方案：
-- 自定义 Partitioner 给热点 key 单独分区
-- 生产端对热点 key 拆分（userId_0, userId_1 ... userId_N）
-- 临时将热点分区转发到专门的消费者组
+**诊断方法**：
+```bash
+# 1. 查看各分区的 Offset 差异
+bin/kafka-run-class.sh kafka.tools.GetOffsetShell \
+  --broker-list localhost:9092 --topic user-events --time -1
+
+# 2. 查看 Consumer Group 各分区的 Lag
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group my-group
+# 输出中 LAG 列：某分区 100 万、其他分区 100 → 热点确认
+
+# 3. 查看各分区的磁盘大小
+du -sh /data/kafka-logs/user-events-*/   # 某目录远大于其他
+```
+
+**分层解决方案**：
+
+| 层级 | 方案 | 适用场景 | 复杂度 |
+|------|------|---------|--------|
+| 应用层 | 自定义 Partitioner 对热点 key 子分区（`hot_user_0` ~ `hot_user_9`） | 已知热点 key | 中 |
+| 应用层 | 生产端对热点 key 加盐（`hot_user_0`...`hot_user_N`），消费端聚合 | 已知热点 key | 高 |
+| 应用层 | 单独 Topic + 单独 Consumer Group 处理热点实体 | 可预见的热点 | 中 |
+| 架构层 | 热点分区拆分：停止写入 → 迁移热点 key 到新分区 → 恢复 | 事后修复 | 高（有停机） |
+| 运维层 | 临时将热点分区迁移到 SSD Broker | 应急 | 低 |
+| 运维层 | 热点分区单独扩容（增加该分区所在 Broker 的资源） | 应急 | 低 |
+
+> **为什么不能用简单的 `hash(key) % N` 解决？** 热点 key 的问题不在于 hash 算法，而在于**同一个 key 的消息量远大于其他 key**。hash 只能保证不同 key 均匀分布，不能拆分同一个 key。所以需要"加盐"——在 key 后追加序号，人为把一个热点 key 拆成多个逻辑 key。
+
+**面试追问：消费端如何聚合"加盐"后的分裂 key？**
+```
+生产端：
+  hot_user_id → hash(hot_user_id + "_0") → P0
+  hot_user_id → hash(hot_user_id + "_1") → P1
+  ...
+
+消费端：
+  所有分区消费的消息都有 key_prefix = "hot_user_id"
+  → 使用本地缓存或 Redis 按 key_prefix 聚合
+  → 按时间窗口排序 → 串行处理（保证逻辑有序）
+```
 
 ### 死信队列与消费重试设计
 
@@ -3071,6 +3219,23 @@ func mapToHeaders(m map[string]string) []sarama.RecordHeader {
     }
     return headers
 }
+
+func headersToMap(headers []*sarama.RecordHeader) map[string]string {
+    m := make(map[string]string, len(headers))
+    for _, h := range headers {
+        m[string(h.Key)] = string(h.Value)
+    }
+    return m
+}
+
+func getHeader(msg *sarama.ConsumerMessage, key string) string {
+    for _, h := range msg.Headers {
+        if string(h.Key) == key {
+            return string(h.Value)
+        }
+    }
+    return ""
+}
 ```
 
 ### 2.2 同步发送（强依赖结果的场景）
@@ -3127,6 +3292,8 @@ func NewIdempotentProducer(cfg Config) (*AsyncProducer, error) {
 
 ```go
 // 典型场景：消费 Topic-A → 处理 → 写入 Topic-B → 提交消费 Offset（原子）
+// 注意：此为 Sarama 事务 API 的示意代码，实际使用需参考 Sarama 最新版本文档
+
 func TransactionalConsumeProcessProduce(
     cfg Config,
     transactionalID string,
@@ -3136,64 +3303,102 @@ func TransactionalConsumeProcessProduce(
     if err != nil {
         return err
     }
+    // 事务必需配置
     saramaCfg.Producer.Idempotent = true
     saramaCfg.Producer.RequiredAcks = sarama.WaitForAll
     saramaCfg.Producer.Transaction.ID = transactionalID
-    // 事务超时：Broker 端 transaction.timeout.ms 默认 15 分钟，Client 端需 ≤ Broker 端
     saramaCfg.Producer.Transaction.Timeout = 10 * time.Minute
+    // 事务模式必须启用幂等、开启 Success 回调
+    saramaCfg.Producer.Return.Successes = true
+    saramaCfg.Net.MaxOpenRequests = 1 // 事务模式下通常为 1
 
-    // 1. 创建带事务能力的 Producer
+    // 1. 创建事务 Producer
     producer, err := sarama.NewAsyncProducer(cfg.Brokers, saramaCfg)
     if err != nil {
-        return err
+        return fmt.Errorf("create transactional producer: %w", err)
     }
     defer producer.Close()
 
-    // 2. 初始化事务（向 TC 注册 Transactional ID → 获取 PID + Epoch）
+    // 2. 初始化事务：向 TC 注册 Transactional ID → 获取 PID + Producer Epoch
+    //    Sarama 中 initTransactions() 由 Producer 在 BeginTxn 时自动完成
     if err := producer.BeginTxn(); err != nil {
         return fmt.Errorf("begin txn: %w", err)
     }
 
-    // 3. 消费消息（独立 Consumer，不使用 Consumer Group 简化示例）
-    consumer, _ := sarama.NewConsumer(cfg.Brokers, saramaCfg)
+    // 3. 消费并处理（简化示例：独立 Consumer，真实场景用 Consumer Group）
+    consumer, err := sarama.NewConsumer(cfg.Brokers, saramaCfg)
+    if err != nil {
+        return err
+    }
     defer consumer.Close()
-    pc, _ := consumer.ConsumePartition(consumeTopic, 0, sarama.OffsetOldest)
 
-    txnSession := producer.NewTransactionSession()
-    ctx := context.Background()
+    pc, err := consumer.ConsumePartition(consumeTopic, 0, sarama.OffsetOldest)
+    if err != nil {
+        return err
+    }
+    defer pc.Close()
 
-    for msg := range pc.Messages() {
-        // 3a. 发送到产出 Topic（事务性写入）
+    batchSize := 100
+    consumedOffsets := make(map[int64]struct{})
+
+    for i, msg := range pc.Messages() {
+        // 3a. 发送到产出 Topic（事务性写入 —— 消息标记为事务消息，对 read_committed 消费者不可见）
         producer.Input() <- &sarama.ProducerMessage{
             Topic: produceTopic,
             Key:   msg.Key,
             Value: msg.Value,
         }
 
-        // 3b. 每处理一批提交一次事务（原子提交：产出消息 + 消费 Offset）
-        if err := producer.AddOffsetsToTxn(
-            map[string][]*sarama.PartitionOffsetMetadata{
+        // 3b. 记录消费 Offset（后续和产出消息原子提交）
+        consumedOffsets[msg.Offset] = struct{}{}
+
+        // 3c. 每攒够一批提交一次事务（不是每条消息一个事务！）
+        if (i+1)%batchSize == 0 {
+            // AddOffsetsToTxn: 将消费的 Offset 加入事务
+            // 参数：map[TopicPartition]Offset, consumerGroupID
+            offsetMap := map[string][]*sarama.PartitionOffsetMetadata{
                 consumeTopic: {
-                    {Partition: msg.Partition, Offset: msg.Offset + 1},
+                    {
+                        Partition: msg.Partition,
+                        Offset:    msg.Offset + 1, // 提交的是"下一次要消费的位置"
+                    },
                 },
-            },
-            txnSession.ConsumerGroupID(),
-        ); err != nil {
-            producer.AbortTxn()
-            return err
-        }
+            }
+            // groupID 来自你的 Consumer Group 配置
+            if err := producer.AddOffsetsToTxn(offsetMap, cfg.Consumer.GroupID); err != nil {
+                producer.AbortTxn()
+                return fmt.Errorf("add offsets to txn: %w", err)
+            }
 
+            if err := producer.CommitTxn(); err != nil {
+                return fmt.Errorf("commit txn: %w", err)
+            }
+
+            // 开始下一批的事务
+            if err := producer.BeginTxn(); err != nil {
+                return fmt.Errorf("begin next txn: %w", err)
+            }
+        }
+    }
+
+    // 4. 提交最后一批（少于 batchSize 的残余消息）
+    if len(consumedOffsets) > 0 {
         if err := producer.CommitTxn(); err != nil {
-            return err
+            producer.AbortTxn()
+            return fmt.Errorf("commit final txn: %w", err)
         }
-
-        // 3c. 开启下一个事务
-        producer.BeginTxn()
-        _ = ctx // 实际使用 context 控制生命周期
     }
 
     return nil
 }
+
+// 关键要点：
+//   1. 事务 Producer 必须开启幂等性 (Idempotent=true) + acks=all
+//   2. Transactional ID 全局唯一，用于跨会话 Fencing（Zombie 防护）
+//   3. 事务超时需 ≤ Broker 端 transaction.timeout.ms（默认 15 分钟）
+//   4. 不是每条消息一个事务 —— 攒批提交才能保证吞吐
+//   5. AddOffsetsToTxn 之后必须 CommitTxn（或 AbortTxn），否则 TC 超时后自动 Abort
+```
 ```
 
 ### 2.5 自定义 Partitioner（热点 Key 拆分）
@@ -3958,9 +4163,272 @@ func (p *OrderLifecycleProcessor) Process(ctx context.Context, msg *sarama.Consu
 // ✅ 正确做法：单分区内串行处理，只在需要并行时开 Worker 池 + 保证相同 key 进同一 Worker
 ```
 
----
+### 4.7 Request-Reply 请求-响应模式
 
-## 五、可靠性 & 容错
+Kafka 不是天然的请求-响应系统，但面试常问"怎么用 Kafka 实现同步调用"：
+
+```
+Producer (请求方)                        Consumer (处理方)
+    │                                        │
+    │──→ request-topic ──────────────────→   │  收到请求，处理
+    │     headers: X-Correlation-Id,         │
+    │              X-Reply-Topic             │
+    │                                        │
+    │←── reply-topic ─────────────────────   │  发送响应（相同 Correlation-Id）
+    │     key = Correlation-Id               │
+    │                                        │
+    通过 Correlation-Id 匹配请求与响应
+```
+
+**Go 实现**：
+
+```go
+// ===== 请求方 =====
+type RequestReplyClient struct {
+    ap         *AsyncProducer
+    pending    sync.Map // map[correlationID] chan response
+    consumer   sarama.Consumer
+}
+
+func NewRequestReplyClient(cfg Config, replyTopic string) (*RequestReplyClient, error) {
+    // ... 初始化 Producer 和 Consumer（监听 reply-topic）
+    return &RequestReplyClient{}, nil
+}
+
+// Request 发送请求并等待响应（带超时）
+func (c *RequestReplyClient) Request(
+    ctx context.Context,
+    requestTopic string,
+    key, payload []byte,
+    timeout time.Duration,
+) ([]byte, error) {
+    correlationID := uuid.New().String()
+    replyChan := make(chan []byte, 1)
+
+    // 注册等待
+    c.pending.Store(correlationID, replyChan)
+    defer c.pending.Delete(correlationID)
+
+    // 发送请求（Header 中带 correlationID + reply topic）
+    c.ap.Send(ctx, requestTopic, key, payload, map[string]string{
+        "X-Correlation-ID": correlationID,
+        "X-Reply-Topic":    "order-replies", // 硬编码或动态传
+    })
+
+    // 等待响应
+    select {
+    case reply := <-replyChan:
+        return reply, nil
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    case <-time.After(timeout):
+        return nil, fmt.Errorf("request timed out after %s", timeout)
+    }
+}
+
+// ===== 处理方 =====
+func (p *RequestProcessor) Process(ctx context.Context, msg *sarama.ConsumerMessage) error {
+    correlationID := getHeader(msg, "X-Correlation-ID")
+    replyTopic := getHeader(msg, "X-Reply-Topic")
+
+    // 处理请求
+    result, err := p.handle(ctx, msg.Key, msg.Value)
+    if err != nil {
+        // 错误也作为响应返回
+        result = []byte(`{"error":"` + err.Error() + `"}`)
+    }
+
+    // 发送响应：key = correlationID（保证请求方能匹配）
+    p.ap.Send(ctx, replyTopic,
+        []byte(correlationID), // key = correlationID
+        result,
+        map[string]string{
+            "X-Correlation-ID": correlationID,
+        },
+    )
+    return nil
+}
+
+// 局限与替代方案：
+//   1. 不适合高并发同步调用 → 考虑 gRPC/HTTP
+//   2. reply-topic 需要 Consumer Group 正确配置（所有请求方实例同组负载均衡 → 用 key 路由到正确实例）
+//   3. 更推荐的方案：异步回调 → 收到响应后回调 callback，不阻塞
+```
+
+### 4.8 大消息处理（> 1MB）
+
+Kafka 默认单条消息最大 1MB（`message.max.bytes`）。处理大消息的面试思路：
+
+```go
+// ===== 方案 1：消息体外部存储（推荐） =====
+// 大 Payload → S3/OSS/MinIO → Kafka 只传引用
+type LargeMessageRef struct {
+    RefID     string `json:"ref_id"`     // "s3://bucket/key"
+    Size      int64  `json:"size"`       // 原始大小
+    Checksum  string `json:"checksum"`   // SHA256 校验
+    ExpiresAt int64  `json:"expires_at"` // 引用过期时间
+}
+
+func SendLargePayload(ctx context.Context, ap *AsyncProducer,
+    topic string, key string, payload []byte,
+) error {
+    const threshold = 900 * 1024 // 900KB，留 100KB 给 Headers + 包装
+
+    if len(payload) <= threshold {
+        // 小消息直接发送
+        ap.Send(ctx, topic, []byte(key), payload, nil)
+        return nil
+    }
+
+    // 大消息：上传到 S3，发引用
+    objectKey := fmt.Sprintf("kafka-large-msgs/%s/%s", topic, uuid.New().String())
+    checksum := sha256Hex(payload)
+
+    if err := s3Upload(ctx, "my-bucket", objectKey, payload); err != nil {
+        return fmt.Errorf("s3 upload: %w", err)
+    }
+
+    ref, _ := json.Marshal(LargeMessageRef{
+        RefID:     fmt.Sprintf("s3://my-bucket/%s", objectKey),
+        Size:      int64(len(payload)),
+        Checksum:  checksum,
+        ExpiresAt: time.Now().Add(7 * 24 * time.Hour).Unix(),
+    })
+
+    ap.Send(ctx, topic, []byte(key), ref, map[string]string{
+        "X-Large-Message": "true",
+    })
+    return nil
+}
+
+// Consumer 端：检查 X-Large-Message Header → 从 S3 下载 → 处理
+
+// ===== 方案 2：分片 + 顺序重组 =====
+// 适用于消息天然可分片（如批量事件列表）
+func SendChunked(ctx context.Context, ap *AsyncProducer,
+    topic string, key string, payload []byte, maxChunkSize int,
+) error {
+    totalChunks := (len(payload) + maxChunkSize - 1) / maxChunkSize
+    msgID := uuid.New().String()
+
+    for i := 0; i < totalChunks; i++ {
+        start := i * maxChunkSize
+        end := min(start+maxChunkSize, len(payload))
+
+        ap.Send(ctx, topic, []byte(key), payload[start:end], map[string]string{
+            "X-Message-ID":    msgID,
+            "X-Chunk-Index":   strconv.Itoa(i),
+            "X-Chunk-Total":   strconv.Itoa(totalChunks),
+        })
+    }
+    return nil
+}
+
+// Consumer 端：用本地缓存收集同一 Message-ID 的所有分片 → 排序 → 拼接 → 处理
+
+// ===== 面试回答要点 =====
+// 1. 首选方案：外部存储引用（消息体不变，性能最优）
+// 2. 次选方案：分片（对 Consumer 有复杂度，需处理丢片/超时）
+// 3. 调大 message.max.bytes 是最后的办法（影响 Broker 内存和网络效率）
+```
+
+### 4.9 消息重放与批量补偿
+
+```go
+// 场景：业务逻辑 bug 导致某段时间内消费的数据写错了，需要从 Kafka 重新消费修正
+
+// ===== 模式 1：按时间范围重放 =====
+func ReplayByTimeRange(
+    ctx context.Context,
+    brokers []string,
+    topic string,
+    startTime, endTime time.Time,
+    handler func(*sarama.ConsumerMessage) error,
+) error {
+    consumer, err := sarama.NewConsumer(brokers, sarama.NewConfig())
+    if err != nil {
+        return err
+    }
+    defer consumer.Close()
+
+    partitions, err := consumer.Partitions(topic)
+    if err != nil {
+        return err
+    }
+
+    var wg sync.WaitGroup
+    errCh := make(chan error, len(partitions))
+
+    for _, p := range partitions {
+        wg.Add(1)
+        go func(partition int32) {
+            defer wg.Done()
+
+            // 1. 查询时间对应的 Offset
+            startOff, err := findOffsetByTime(consumer, topic, partition, startTime)
+            if err != nil {
+                errCh <- err
+                return
+            }
+            endOff, err := findOffsetByTime(consumer, topic, partition, endTime)
+            if err != nil {
+                errCh <- err
+                return
+            }
+
+            // 2. 消费该范围的每条消息
+            pc, err := consumer.ConsumePartition(topic, partition, startOff)
+            if err != nil {
+                errCh <- err
+                return
+            }
+            defer pc.Close()
+
+            for msg := range pc.Messages() {
+                if msg.Offset >= endOff {
+                    return // 超出时间范围
+                }
+                if err := handler(msg); err != nil {
+                    errCh <- err
+                    return
+                }
+            }
+        }(p)
+    }
+
+    wg.Wait()
+    close(errCh)
+
+    for err := range errCh {
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+func findOffsetByTime(consumer sarama.Consumer, topic string,
+    partition int32, t time.Time,
+) (int64, error) {
+    // 用 Consumer.OffsetsByTimes 查找
+    // Sarama API: consumer.(*consumer).offsetsByTimes(...)
+    return consumer.(interface {
+        OffsetsByTimes(map[int32]int64, time.Duration) (map[int32]int64, error)
+    }).(interface{ OffsetsByTimes(...) }) // 简化示意
+
+    // 实际生产中：offsetsForTimes(topic, partition, t.UnixMilli())
+}
+
+// ===== 模式 2：双写 + 补偿 =====
+// 业务 Consumer 每次写 DB 时同时写入"消费记录表"
+// 每日定时任务：对比 DB 数据 vs Kafka 源消息 → 发现不一致 → 触发补偿重放
+
+// ===== 模式 3：重置 Consumer Group Offset（运维方式） =====
+// kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+//   --group my-group --topic orders --reset-offsets \
+//   --to-datetime 2025-01-15T00:00:00.000 --execute
+//
+// 然后重启 Consumer → 从指定时间点重新消费
 
 ### 5.1 优雅关闭（Graceful Shutdown）
 
@@ -3975,7 +4443,13 @@ func RunWithGracefulShutdown(
     ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
     defer cancel()
 
-    group, err := sarama.NewConsumerGroup(cfg.Brokers, cfg.Consumer.GroupID, mustConfig(cfg))
+    saramaCfg, err := NewSaramaConfig(cfg)
+    if err != nil {
+        return err
+    }
+    saramaCfg.Consumer.Offsets.AutoCommit.Enable = false
+
+    group, err := sarama.NewConsumerGroup(cfg.Brokers, cfg.Consumer.GroupID, saramaCfg)
     if err != nil {
         return err
     }
@@ -4483,6 +4957,35 @@ func TestKafkaIntegration(t *testing.T) {
 
 ---
 
+### 常见场景速查表
+
+| 你要做什么 | 对应模式 | 代码位置 |
+|-----------|---------|---------|
+| 异步削峰 | 异步 Producer | §2.1 |
+| 发送必须成功才继续 | 同步 Producer | §2.2 |
+| 防网络重试导致重复 | 幂等 Producer | §2.3 |
+| 消费 → 处理 → 写入，原子提交 | 事务 Producer | §2.4 |
+| 热点 key 拆分 | 自定义 Partitioner | §2.5 |
+| 消费者组消费 | Consumer Group 标准模式 | §3.1 |
+| 每秒提交一次 Offset | 手动分段提交 | §3.2 |
+| 回溯历史数据 | 指定 Partition + Offset | §3.3 |
+| 感知 Rebalance 事件 | Rebalance 监听 | §3.4 |
+| 同一订单的事件有序处理 | 顺序消费 | §4.6 |
+| 异步任务分发 | 异步任务队列 | §4.1 |
+| 订单 → 通知 + 物流 + 分析 | 事件驱动 | §4.2 |
+| 消费失败 3 次进死信 | 死信队列 | §4.3 |
+| 30 分钟后执行某个操作 | 延时消费 | §4.4 |
+| 攒 100 条再写 DB | 批量聚合 | §4.5 |
+| 发请求等响应 | Request-Reply | §4.7 |
+| 消息体超过 1MB | 大消息处理 | §4.8 |
+| 业务 bug 需要重新消费 | 消息重放 | §4.9 |
+| 进程重启不丢消息 | 优雅关闭 | §5.1 |
+| 处理失败自动重试 | 指数退避重试 | §5.2 |
+| DB/下游挂了自动停消费 | 消费熔断器 | §5.3 |
+| 防止同一条消息被处理两次 | 消费去重 | §5.4 |
+| 全链路追踪 | OTel Headers 注入 | §6.2 |
+| K8s 存活/就绪检查 | 健康检查 | §6.3 |
+
 ## 八、速记总结
 
 - **Iron Law**：手动提交 Offset、复用 Producer/Consumer 实例、处理失败不提交、同 key 有序不并发
@@ -4491,6 +4994,8 @@ func TestKafkaIntegration(t *testing.T) {
   - `sarama.NewBalanceStrategySticky()` + 静态成员减少 Rebalance
   - `sarama.Producer.Idempotent = true` 防网络重试重复
   - 死信队列：用 Header 传 `x-retry-count` + `x-original-topic`
+  - Request-Reply：Correlation-ID + reply-topic 实现伪同步
+  - 大消息：外部存储引用（S3/MinIO）+ Kafka 只传元数据
 - **生产必备**：
   - Prometheus 监控 QPS/失败率/Lag/Rebalance 次数
   - OpenTelemetry TraceID 通过 Headers 跨服务传递
