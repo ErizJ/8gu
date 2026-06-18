@@ -18,6 +18,7 @@
 | 🌐 计算机网络 | [cn.md](cn.md) | TCP/IP、HTTP、HTTPS、网络编程 |
 | 🧠 LeetCode | [lc.md](lc.md) | 算法数据结构、解题模板、高频题 |
 | 🤖 AI Agent | [ai_agent.md](ai_agent.md) | AI Agent 架构、设计模式、面试题 |
+| 🔍 RAG | [rag.md](rag.md) | 检索增强生成全链路 — Embedding / 向量DB / Pipeline / 40道面试题 |
 | 🔌 MCP | [mcp.md](mcp.md) | Model Context Protocol 原理与实践 |
 
 ## 🎯 使用建议
